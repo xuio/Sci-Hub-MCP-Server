@@ -103,6 +103,8 @@ Sci-Hub remains the first lookup target. When a DOI/title search is not resolved
 
 - Unpaywall
 - OpenAlex
+- Crossref full-text link metadata
+- Publisher URL heuristics (Nature/Springer/SAGE/Wiley/Frontiers patterns)
 - arXiv
 - bioRxiv / medRxiv
 - Google Scholar (best-effort scraping)
@@ -112,6 +114,8 @@ Environment variables:
 - `UNPAYWALL_EMAIL`: Required to enable Unpaywall API calls
 - `SCIHUB_ENABLE_UNPAYWALL`: Enable/disable Unpaywall fallback (`true` by default)
 - `SCIHUB_ENABLE_OPENALEX`: Enable/disable OpenAlex fallback (`true` by default)
+- `SCIHUB_ENABLE_CROSSREF`: Enable/disable Crossref link fallback (`true` by default)
+- `SCIHUB_ENABLE_PUBLISHER_GUESS`: Enable/disable publisher URL heuristic fallback (`true` by default)
 - `SCIHUB_ENABLE_ARXIV`: Enable/disable arXiv fallback (`true` by default)
 - `SCIHUB_ENABLE_RXIV`: Enable/disable bioRxiv/medRxiv fallback (`true` by default)
 - `SCIHUB_ENABLE_GOOGLE_SCHOLAR`: Enable/disable Google Scholar fallback (`true` by default)
@@ -128,6 +132,10 @@ Each item has:
 ### Download Behavior
 
 `download_scihub_pdf` accepts DOI strings, direct PDF URLs, and landing/page URLs (including Sci-Hub pages and open-access landing pages).  
+For best reliability, pass the DOI directly whenever available so the downloader can fan out across all fallback providers.
+
+When PMCID-based links return dynamic \"Preparing to download...\" pages, the downloader can fall back to the PMC OA package API (`oa.fcgi`) and extract the PDF from the official archive tarball.
+
 If the provided `output_path` is not writable in the MCP runtime (for example VM paths like `/home/claude/...`), it automatically falls back to `SCIHUB_DOWNLOAD_DIR` (or `~/Downloads`).
 
 ## Usage with Claude Desktop (Network MCP Connectors)

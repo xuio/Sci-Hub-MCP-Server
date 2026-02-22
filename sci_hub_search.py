@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import tarfile
+import tempfile
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Tuple
 from urllib.parse import quote, unquote, urljoin, urlparse
@@ -28,10 +30,31 @@ DEFAULT_USER_AGENT = (
 
 DOI_PATTERN = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", re.IGNORECASE)
 YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
+PMCID_PATTERN = re.compile(r"/articles/(?:PMC)?(\d+)", re.IGNORECASE)
 ARXIV_NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
 }
+
+NON_PDF_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mp3",
+    ".wav",
+    ".txt",
+    ".xml",
+    ".json",
+)
 
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("scihub").setLevel(logging.ERROR)
@@ -106,14 +129,15 @@ def _build_session():
     else:
         session = requests.Session()
 
-    session.headers.update(
-        {
-            "User-Agent": os.getenv("SCIHUB_USER_AGENT", DEFAULT_USER_AGENT),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": os.getenv("SCIHUB_REFERER", "https://sci-hub.ren/"),
-        }
-    )
+    headers = {
+        "User-Agent": os.getenv("SCIHUB_USER_AGENT", DEFAULT_USER_AGENT),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    explicit_referer = os.getenv("SCIHUB_REFERER", "").strip()
+    if explicit_referer:
+        headers["Referer"] = explicit_referer
+    session.headers.update(headers)
 
     cookie_header = os.getenv("SCIHUB_COOKIE", "").strip()
     if cookie_header:
@@ -268,6 +292,54 @@ def _extract_doi_from_url(value: str) -> str:
     return _extract_doi_from_text(value or "")
 
 
+def _extract_pmcid_from_url(value: str) -> str:
+    parsed = urlparse(value or "")
+    target = f"{parsed.netloc}{parsed.path}"
+    match = PMCID_PATTERN.search(target)
+    if not match:
+        return ""
+    return f"PMC{match.group(1)}"
+
+
+def _is_obviously_non_pdf_url(value: str) -> bool:
+    parsed = urlparse(value or "")
+    path = (parsed.path or "").lower()
+    if any(path.endswith(ext) for ext in NON_PDF_EXTENSIONS):
+        return True
+    if "/content/image/" in path:
+        return True
+    return False
+
+
+def _is_probably_pdf_url(value: str) -> bool:
+    parsed = urlparse(value or "")
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+
+    if _is_obviously_non_pdf_url(value):
+        return False
+    if path.endswith(".pdf"):
+        return True
+    if "/pdf/" in path:
+        return True
+    if path.endswith("/pdf"):
+        return True
+    if "download" in path and "pdf" in (path + "?" + query):
+        return True
+    if query and "pdf" in query and "format=pdf" in query:
+        return True
+    return False
+
+
+def _is_pmc_article_url(value: str) -> bool:
+    parsed = urlparse(value or "")
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if "ncbi.nlm.nih.gov" not in host:
+        return False
+    return bool(PMCID_PATTERN.search(path))
+
+
 def _extract_pdf_url_from_html(html: str, page_url: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     candidates: List[str] = []
@@ -373,10 +445,18 @@ def _try_identifier_with_mirror(session, mirror_host: str, identifier: str, time
     last_reason = "no_response"
     for method, url, payload in endpoints:
         try:
+            mirror_headers = {"Referer": f"https://{mirror_host}/"}
             if method == "get":
-                response = session.get(url, timeout=timeout, verify=False, allow_redirects=True)
+                response = session.get(url, timeout=timeout, verify=False, allow_redirects=True, headers=mirror_headers)
             else:
-                response = session.post(url, data=payload, timeout=timeout, verify=False, allow_redirects=True)
+                response = session.post(
+                    url,
+                    data=payload,
+                    timeout=timeout,
+                    verify=False,
+                    allow_redirects=True,
+                    headers=mirror_headers,
+                )
         except Exception as exc:
             last_reason = f"request_error:{type(exc).__name__}"
             continue
@@ -471,6 +551,137 @@ def _get_crossref_metadata(doi: str) -> Dict[str, str]:
         return {}
 
 
+def _crossref_payload(doi: str) -> Dict[str, Any]:
+    try:
+        response = requests.get(
+            f"https://api.crossref.org/works/{quote(doi, safe='')}",
+            timeout=15,
+            headers=_api_headers(),
+        )
+        if response.status_code != 200:
+            return {}
+        return response.json().get("message", {}) or {}
+    except Exception:
+        return {}
+
+
+def _get_crossref_candidates(doi: str) -> Tuple[List[Dict[str, Any]], str]:
+    if not _provider_enabled("CROSSREF", True):
+        return [], "disabled"
+
+    payload = _crossref_payload(doi)
+    if not payload:
+        return [], "no_results"
+
+    metadata = _get_crossref_metadata(doi)
+    candidates: List[Dict[str, Any]] = []
+
+    def add(url: str, direct_pdf: bool = False) -> None:
+        clean = (url or "").strip()
+        if not clean:
+            return
+        candidates.append(
+            _build_candidate(
+                provider="crossref",
+                pdf_url=clean,
+                landing_url=clean,
+                doi=doi,
+                title=metadata.get("title", ""),
+                author=metadata.get("author", ""),
+                year=metadata.get("year", ""),
+                direct_pdf=direct_pdf or _is_probably_pdf_url(clean),
+            )
+        )
+
+    for link in payload.get("link", []) or []:
+        if not isinstance(link, dict):
+            continue
+        url = (link.get("URL") or "").strip()
+        content_type = (link.get("content-type") or "").lower()
+        if not url:
+            continue
+        add(url, direct_pdf=("pdf" in content_type or _is_probably_pdf_url(url)))
+
+    resource_url = (
+        payload.get("resource", {}).get("primary", {}).get("URL")
+        if isinstance(payload.get("resource"), dict)
+        else ""
+    )
+    if resource_url:
+        add(resource_url, direct_pdf=_is_probably_pdf_url(resource_url))
+
+    return _dedupe_candidates(candidates), "ok" if candidates else "no_links"
+
+
+def _get_publisher_guess_candidates(doi: str) -> Tuple[List[Dict[str, Any]], str]:
+    if not _provider_enabled("PUBLISHER_GUESS", True):
+        return [], "disabled"
+
+    normalized = (doi or "").strip()
+    if not normalized or "/" not in normalized:
+        return [], "invalid_doi"
+
+    suffix = normalized.split("/", 1)[1]
+    prefix = normalized.split("/", 1)[0].lower()
+    metadata = _get_crossref_metadata(normalized)
+    candidates: List[Dict[str, Any]] = []
+
+    def add(url: str, direct_pdf: bool = False) -> None:
+        clean = (url or "").strip()
+        if not clean:
+            return
+        candidates.append(
+            _build_candidate(
+                provider="publisher_guess",
+                pdf_url=clean,
+                landing_url=clean,
+                doi=normalized,
+                title=metadata.get("title", ""),
+                author=metadata.get("author", ""),
+                year=metadata.get("year", ""),
+                direct_pdf=direct_pdf or _is_probably_pdf_url(clean),
+            )
+        )
+
+    # Nature journals
+    if prefix == "10.1038":
+        add(f"https://www.nature.com/articles/{suffix}", direct_pdf=False)
+        add(f"https://www.nature.com/articles/{suffix}.pdf", direct_pdf=True)
+
+    # Springer/BMC
+    if prefix == "10.1186" or prefix.startswith("10.1007"):
+        add(f"https://link.springer.com/content/pdf/{normalized}.pdf", direct_pdf=True)
+        add(f"https://link.springer.com/article/{normalized}", direct_pdf=False)
+
+    # SAGE
+    if prefix == "10.1177":
+        add(f"https://journals.sagepub.com/doi/pdf/{normalized}", direct_pdf=True)
+        add(f"https://journals.sagepub.com/doi/{normalized}", direct_pdf=False)
+
+    # BMJ family
+    if prefix == "10.1136":
+        add(f"https://doi.org/{normalized}", direct_pdf=False)
+
+    # Wiley frequently hosts legacy Hindawi content.
+    if prefix == "10.1155":
+        add(f"https://onlinelibrary.wiley.com/doi/pdf/{normalized}", direct_pdf=True)
+        add(f"https://onlinelibrary.wiley.com/doi/{normalized}", direct_pdf=False)
+
+    # Frontiers direct PDF endpoint.
+    if prefix == "10.3389":
+        journal_code = suffix.split(".", 1)[0] if "." in suffix else ""
+        frontiers_slug_map = {
+            "fneur": "neurology",
+            "fpsyt": "psychiatry",
+        }
+        slug = frontiers_slug_map.get(journal_code, "")
+        if slug:
+            add(f"https://www.frontiersin.org/journals/{slug}/articles/{normalized}/pdf", direct_pdf=True)
+            add(f"https://www.frontiersin.org/journals/{slug}/articles/{normalized}/full", direct_pdf=False)
+
+    return _dedupe_candidates(candidates), "ok" if candidates else "no_patterns"
+
+
 def _build_candidate(
     provider: str,
     pdf_url: str = "",
@@ -481,15 +692,29 @@ def _build_candidate(
     year: str = "",
     direct_pdf: bool = False,
 ) -> Dict[str, Any]:
+    clean_pdf_url = (pdf_url or "").strip()
+    clean_landing_url = (landing_url or "").strip()
+
+    if clean_pdf_url and _is_obviously_non_pdf_url(clean_pdf_url):
+        # Keep as landing URL only when no better landing is provided.
+        if not clean_landing_url:
+            clean_landing_url = clean_pdf_url
+        clean_pdf_url = ""
+
+    if clean_landing_url and _is_obviously_non_pdf_url(clean_landing_url) and not clean_pdf_url:
+        clean_landing_url = ""
+
+    effective_direct_pdf = bool(direct_pdf and clean_pdf_url and _is_probably_pdf_url(clean_pdf_url))
+
     return {
         "provider": provider,
-        "pdf_url": (pdf_url or "").strip(),
-        "landing_url": (landing_url or "").strip(),
+        "pdf_url": clean_pdf_url,
+        "landing_url": clean_landing_url,
         "doi": (doi or "").strip(),
         "title": (title or "").strip(),
         "author": (author or "").strip(),
         "year": (year or "").strip(),
-        "direct_pdf": bool(direct_pdf),
+        "direct_pdf": effective_direct_pdf,
     }
 
 
@@ -527,28 +752,37 @@ def _merge_metadata(primary: Dict[str, str], fallback: Dict[str, str]) -> Dict[s
     return merged
 
 
+def _candidate_sort_key(item: Dict[str, Any]):
+    provider_order = {
+        "unpaywall": 0,
+        "openalex": 1,
+        "crossref": 2,
+        "publisher_guess": 3,
+        "arxiv": 4,
+        "biorxiv": 5,
+        "medrxiv": 6,
+        "google_scholar": 7,
+    }
+
+    provider = (item.get("provider") or "").lower()
+    primary_url = _candidate_primary_url(item)
+    parsed = urlparse(primary_url)
+    return (
+        0 if item.get("direct_pdf") else 1,
+        0 if _is_probably_pdf_url(primary_url) else 1,
+        0 if _is_pmc_article_url(primary_url) else 1,
+        1 if _is_obviously_non_pdf_url(primary_url) else 0,
+        1 if parsed.netloc.lower().endswith("doi.org") else 0,
+        provider_order.get(provider, 99),
+        0 if item.get("doi") else 1,
+    )
+
+
 def _choose_best_candidate(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not candidates:
         return {}
 
-    provider_order = {
-        "unpaywall": 0,
-        "openalex": 1,
-        "arxiv": 2,
-        "biorxiv": 3,
-        "medrxiv": 4,
-        "google_scholar": 5,
-    }
-
-    def sort_key(item: Dict[str, Any]):
-        provider = (item.get("provider") or "").lower()
-        return (
-            0 if item.get("direct_pdf") else 1,
-            provider_order.get(provider, 99),
-            0 if item.get("doi") else 1,
-        )
-
-    ranked = sorted(candidates, key=sort_key)
+    ranked = sorted(candidates, key=_candidate_sort_key)
     return ranked[0]
 
 
@@ -1033,6 +1267,8 @@ def _collect_fallback_candidates_for_doi(doi: str, title_hint: str = "") -> Tupl
     provider_calls = [
         ("unpaywall", lambda: _get_unpaywall_candidates(doi)),
         ("openalex", lambda: _get_openalex_candidates_by_doi(doi)),
+        ("crossref", lambda: _get_crossref_candidates(doi)),
+        ("publisher_guess", lambda: _get_publisher_guess_candidates(doi)),
         ("arxiv", lambda: _search_arxiv(doi, max_results=3, search_field="doi")),
         ("rxiv", lambda: _get_rxiv_candidates_by_doi(doi)),
     ]
@@ -1110,9 +1346,39 @@ def search_paper_by_doi(doi: str) -> Dict[str, Any]:
         normalized_doi, title_hint=metadata.get("title", "")
     )
     if fallback_candidates:
-        chosen = _choose_best_candidate(fallback_candidates)
-        result = _result_from_candidate(normalized_doi, chosen, metadata)
-        return result
+        session = _build_session()
+        timeout = _get_timeout()
+        landing_fallback = None
+
+        for candidate in sorted(fallback_candidates, key=_candidate_sort_key):
+            candidate_url = _candidate_primary_url(candidate)
+            if not candidate_url:
+                continue
+
+            if candidate.get("direct_pdf") or _is_probably_pdf_url(candidate_url):
+                validated_url, reason = _validate_pdf_candidate(session, candidate_url, timeout)
+                if validated_url:
+                    validated_candidate = dict(candidate)
+                    validated_candidate["pdf_url"] = validated_url
+                    validated_candidate["direct_pdf"] = True
+                    return _result_from_candidate(normalized_doi, validated_candidate, metadata)
+                fallback_errors.append(f"{candidate.get('provider', 'unknown')}:{reason}")
+
+                # Keep a PMCID article fallback so download_paper can use the OA package path.
+                pmcid = _extract_pmcid_from_url(candidate_url)
+                if pmcid and landing_fallback is None:
+                    pmc_landing = dict(candidate)
+                    pmc_landing["pdf_url"] = ""
+                    pmc_landing["landing_url"] = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid[3:]}"
+                    pmc_landing["direct_pdf"] = False
+                    landing_fallback = pmc_landing
+                continue
+
+            if landing_fallback is None:
+                landing_fallback = candidate
+
+        if landing_fallback is not None:
+            return _result_from_candidate(normalized_doi, landing_fallback, metadata)
 
     error_chunks = []
     if errors:
@@ -1390,6 +1656,166 @@ def search_papers_by_keyword(keyword: str, num_results: int = 10) -> List[Dict[s
     return papers[:num_results]
 
 
+def _candidate_urls(candidates: List[Dict[str, Any]]) -> List[str]:
+    urls: List[str] = []
+    for candidate in candidates:
+        pdf_url = (candidate.get("pdf_url") or "").strip()
+        landing_url = (candidate.get("landing_url") or "").strip()
+        if pdf_url:
+            urls.append(pdf_url)
+        if landing_url and landing_url != pdf_url:
+            urls.append(landing_url)
+
+    deduped: List[str] = []
+    for url in urls:
+        clean = (url or "").strip()
+        if not clean:
+            continue
+        if clean not in deduped:
+            deduped.append(clean)
+    return deduped
+
+
+def _collect_download_candidates_for_doi(doi: str) -> List[str]:
+    normalized_doi = _extract_doi_from_text(doi) or (doi or "").strip()
+    if not normalized_doi:
+        return []
+
+    urls: List[str] = []
+
+    # Sci-Hub first
+    scihub_url, _mirror, _errors = _resolve_pdf_url(normalized_doi)
+    if scihub_url:
+        urls.append(scihub_url)
+        if "#" in scihub_url:
+            urls.append(scihub_url.split("#", 1)[0])
+
+    # OA and metadata providers
+    fallback_candidates, _ = _collect_fallback_candidates_for_doi(normalized_doi)
+    urls.extend(_candidate_urls(fallback_candidates))
+
+    crossref_candidates, _ = _get_crossref_candidates(normalized_doi)
+    urls.extend(_candidate_urls(crossref_candidates))
+
+    guessed_candidates, _ = _get_publisher_guess_candidates(normalized_doi)
+    urls.extend(_candidate_urls(guessed_candidates))
+
+    # Raw DOI landing URL as last resort.
+    urls.append(f"https://doi.org/{normalized_doi}")
+
+    deduped: List[str] = []
+    for item in urls:
+        clean = (item or "").strip()
+        if not clean:
+            continue
+        if clean not in deduped:
+            deduped.append(clean)
+    return deduped
+
+
+def _pmc_oa_package_url(pmcid: str) -> str:
+    clean = (pmcid or "").strip().upper()
+    if not clean.startswith("PMC"):
+        return ""
+
+    try:
+        response = requests.get(
+            f"https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={clean}",
+            timeout=20,
+            headers=_api_headers(),
+        )
+        if response.status_code != 200:
+            return ""
+
+        match = re.search(r'href="(ftp://ftp\.ncbi\.nlm\.nih\.gov/pub/pmc/oa_package/[^"]+\.tar\.gz)"', response.text)
+        if not match:
+            return ""
+
+        ftp_url = match.group(1)
+        return ftp_url.replace("ftp://ftp.ncbi.nlm.nih.gov/", "https://ftp.ncbi.nlm.nih.gov/")
+    except Exception:
+        return ""
+
+
+def _pick_pdf_member_from_tar(members: List[str]) -> str:
+    pdf_members = [name for name in members if name.lower().endswith(".pdf")]
+    if not pdf_members:
+        return ""
+
+    for preferred in ("/main.pdf",):
+        for name in pdf_members:
+            if name.lower().endswith(preferred):
+                return name
+
+    # Prefer non-supplementary files when available.
+    primary = [name for name in pdf_members if "/mmc" not in name.lower()]
+    if primary:
+        return sorted(primary, key=len)[0]
+
+    return sorted(pdf_members, key=len)[0]
+
+
+def _download_pdf_from_pmc_oa_package(pmcid: str, output_path: str, timeout: float) -> Tuple[bool, str]:
+    package_url = _pmc_oa_package_url(pmcid)
+    if not package_url:
+        return False, "pmc_oa_package_not_found"
+
+    temp_tar_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="scihub_pmc_", suffix=".tar.gz", delete=False) as temp_file:
+            temp_tar_path = temp_file.name
+
+        response = requests.get(
+            package_url,
+            timeout=max(timeout, 30),
+            stream=True,
+            headers=_api_headers(),
+        )
+        if response.status_code >= 400:
+            return False, f"pmc_oa_package_http_{response.status_code}"
+
+        with open(temp_tar_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 64):
+                if chunk:
+                    handle.write(chunk)
+
+        with tarfile.open(temp_tar_path, mode="r:gz") as archive:
+            member_name = _pick_pdf_member_from_tar(archive.getnames())
+            if not member_name:
+                return False, "pmc_oa_package_no_pdf"
+
+            extracted = archive.extractfile(member_name)
+            if extracted is None:
+                return False, "pmc_oa_extract_failed"
+
+            first_chunk = b""
+            with open(output_path, "wb") as destination:
+                while True:
+                    chunk = extracted.read(1024 * 64)
+                    if not chunk:
+                        break
+                    if not first_chunk:
+                        first_chunk = chunk
+                    destination.write(chunk)
+
+            if not first_chunk.startswith(b"%PDF"):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+                return False, "pmc_oa_not_pdf"
+
+            return True, f"{package_url}#{member_name}"
+    except Exception as exc:
+        return False, f"pmc_oa_error:{type(exc).__name__}"
+    finally:
+        if temp_tar_path and os.path.exists(temp_tar_path):
+            try:
+                os.remove(temp_tar_path)
+            except OSError:
+                pass
+
+
 def _expand_download_candidates(session, raw_candidate: str, timeout: float) -> List[str]:
     candidate = (raw_candidate or "").strip()
     if not candidate:
@@ -1413,6 +1839,30 @@ def _expand_download_candidates(session, raw_candidate: str, timeout: float) -> 
     if parsed.netloc.endswith("pmc.ncbi.nlm.nih.gov") and "/articles/" in parsed.path and "/pdf/" not in parsed.path:
         expanded.append(f"{candidate.rstrip('/')}/pdf/")
 
+    # DOI landing URL -> DOI-specific candidate URLs
+    if parsed.netloc.lower().endswith("doi.org"):
+        doi = _extract_doi_from_url(candidate)
+        if doi:
+            expanded.extend(_collect_download_candidates_for_doi(doi))
+
+    # Nature article URL -> direct PDF URL
+    if parsed.netloc.lower().endswith("nature.com") and "/articles/" in parsed.path and not parsed.path.lower().endswith(".pdf"):
+        expanded.append(f"{candidate.rstrip('/')}.pdf")
+
+    # Springer/BMC counter or article URLs -> canonical springer PDF URL
+    if "springer.com" in parsed.netloc.lower() or "biomedcentral.com" in parsed.netloc.lower():
+        doi = _extract_doi_from_url(candidate)
+        if doi:
+            expanded.append(f"https://link.springer.com/content/pdf/{doi}.pdf")
+            expanded.append(f"https://link.springer.com/article/{doi}")
+
+    # SAGE article URLs
+    if "sagepub.com" in parsed.netloc.lower():
+        doi = _extract_doi_from_url(candidate)
+        if doi:
+            expanded.append(f"https://journals.sagepub.com/doi/pdf/{doi}")
+            expanded.append(f"https://journals.sagepub.com/doi/{doi}")
+
     # Generic landing page extraction
     if parsed.scheme in {"http", "https"} and ".pdf" not in parsed.path.lower():
         try:
@@ -1429,6 +1879,8 @@ def _expand_download_candidates(session, raw_candidate: str, timeout: float) -> 
     for item in expanded:
         clean = (item or "").strip()
         if clean and clean not in deduped:
+            if _is_obviously_non_pdf_url(clean):
+                continue
             deduped.append(clean)
     return deduped
 
@@ -1444,11 +1896,7 @@ def download_paper(pdf_url: str, output_path: str) -> Dict[str, Any]:
 
     # Support DOI as input for download.
     if raw_input and _looks_like_doi(raw_input) and not urlparse(raw_input).scheme:
-        resolved = search_paper_by_doi(raw_input)
-        if resolved.get("pdf_url"):
-            candidates.append(resolved.get("pdf_url"))
-        if resolved.get("landing_url"):
-            candidates.append(resolved.get("landing_url"))
+        candidates.extend(_collect_download_candidates_for_doi(raw_input))
 
     if raw_input:
         candidates.append(raw_input)
@@ -1457,14 +1905,7 @@ def download_paper(pdf_url: str, output_path: str) -> Dict[str, Any]:
 
     doi = _extract_doi_from_url(raw_input)
     if doi:
-        refreshed = search_paper_by_doi(doi)
-        refreshed_url = refreshed.get("pdf_url", "")
-        if refreshed_url:
-            candidates.append(refreshed_url)
-            candidates.append(refreshed_url.split("#", 1)[0])
-        landing = refreshed.get("landing_url", "")
-        if landing:
-            candidates.append(landing)
+        candidates.extend(_collect_download_candidates_for_doi(doi))
 
     # Sci-Hub page URL fallback for non-PDF page links.
     parsed = urlparse(raw_input)
@@ -1500,6 +1941,24 @@ def download_paper(pdf_url: str, output_path: str) -> Dict[str, Any]:
                 errors.append(f"{candidate}:{reason}")
             except Exception as exc:
                 errors.append(f"{candidate}:{type(exc).__name__}")
+
+        # PMC fallback path: use OA package tarballs when direct PMCID PDF links
+        # require client-side cookie generation.
+        pmcids: List[str] = []
+        for candidate in deduped_candidates:
+            pmcid = _extract_pmcid_from_url(candidate)
+            if pmcid and pmcid not in pmcids:
+                pmcids.append(pmcid)
+
+        for pmcid in pmcids:
+            ok, source_or_reason = _download_pdf_from_pmc_oa_package(pmcid, resolved_output_path, timeout)
+            if ok:
+                return {
+                    "success": True,
+                    "path": resolved_output_path,
+                    "source_url": source_or_reason,
+                }
+            errors.append(f"pmc:{pmcid}:{source_or_reason}")
     except Exception as exc:
         errors.append(f"global:{type(exc).__name__}:{exc}")
 
