@@ -72,7 +72,10 @@ mcp = FastMCP(
 async def search_scihub_by_doi(doi: str) -> Dict[str, Any]:
     logging.info(f"Searching for paper with DOI: {doi}")
     """
-    Search for a paper on Sci-Hub using its DOI (Digital Object Identifier).
+    Search for a paper by DOI (Digital Object Identifier).
+
+    The resolver prioritizes Sci-Hub mirrors, then tries fallback providers
+    such as Unpaywall, OpenAlex, arXiv/*Rxiv, and Google Scholar.
 
     Args:
         doi (str): The Digital Object Identifier of the paper, a unique alphanumeric string 
@@ -98,7 +101,7 @@ async def search_scihub_by_doi(doi: str) -> Dict[str, Any]:
 async def search_scihub_by_title(title: str) -> Dict[str, Any]:
     logging.info(f"Searching for paper with title: {title}")
     """
-    Search for a paper on Sci-Hub using its title.
+    Search for a paper using title lookup and provider fallbacks.
 
     Args:
         title (str): The full or partial title of the academic paper to search for.
@@ -123,7 +126,7 @@ async def search_scihub_by_title(title: str) -> Dict[str, Any]:
 async def search_scihub_by_keyword(keyword: str, num_results: int = 10) -> List[Dict[str, Any]]:
     logging.info(f"Searching for papers with keyword: {keyword}, number of results: {num_results}")
     """
-    Search for papers on Sci-Hub using a keyword.
+    Search for papers using a keyword with multi-provider fallback.
 
     Args:
         keyword (str): The keyword or search term to use for finding relevant papers.
@@ -151,11 +154,10 @@ async def search_scihub_by_keyword(keyword: str, num_results: int = 10) -> List[
 async def download_scihub_pdf(pdf_url: str, output_path: str) -> str:
     logging.info(f"Attempting to download PDF from {pdf_url} to {output_path}")
     """
-    Download a paper PDF from Sci-Hub.
+    Download a paper PDF from a DOI, direct PDF URL, or landing URL.
 
     Args:
-        pdf_url (str): The URL of the PDF to download. This should be a direct link to the PDF file,
-                 typically obtained from a previous search result's 'pdf_url' field.
+        pdf_url (str): DOI, direct PDF URL, or landing URL to resolve and download.
         output_path (str): The file path where the downloaded PDF should be saved.
                      Should include the filename with .pdf extension.
 
@@ -188,6 +190,9 @@ async def get_paper_metadata(doi: str) -> Dict[str, Any]:
     logging.info(f"Getting metadata for paper with DOI: {doi}")
     """
     Get metadata information for a paper using its DOI.
+
+    Uses the DOI resolver (Sci-Hub + fallback providers) and returns
+    the resolved URL plus metadata fields.
 
     Args:
         doi (str): The Digital Object Identifier of the paper, a unique alphanumeric string

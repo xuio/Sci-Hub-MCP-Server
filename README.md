@@ -2,15 +2,16 @@
 
 [![smithery badge](https://smithery.ai/badge/@JackKuo666/sci-hub-mcp-server)](https://smithery.ai/server/@JackKuo666/sci-hub-mcp-server)
 
-🔍 Enable AI assistants to search, access, and analyze academic papers through Sci-Hub using a simple MCP interface.
+🔍 Enable AI assistants to search, access, and analyze academic papers through Sci-Hub and open-access sources using a simple MCP interface.
 
-The Sci-Hub MCP Server provides a bridge between AI assistants and Sci-Hub's repository of academic literature through the Model Context Protocol (MCP). It allows AI models to search for scientific articles by DOI, title, or keywords, access their metadata, and download PDFs in a programmatic way.
+The Sci-Hub MCP Server provides a bridge between AI assistants and academic paper sources through the Model Context Protocol (MCP). It prioritizes Sci-Hub, then falls back to open-access providers (Unpaywall, OpenAlex, arXiv/*Rxiv, and optional Google Scholar scraping) when needed. It allows AI models to search by DOI, title, or keywords, access metadata, and download PDFs in a programmatic way.
 
 ## ✨ Core Features
 
 - 🔎 Paper Search by DOI: Find papers using their Digital Object Identifier ✅
 - 🔍 Paper Search by Title: Locate papers using their full or partial title ✅
 - 🔑 Paper Search by Keyword: Discover papers related to specific research areas ✅
+- 🔁 Multi-source Fallback: Automatically try Unpaywall, OpenAlex, arXiv/*Rxiv, and Google Scholar when Sci-Hub fails ✅
 - 📊 Metadata Access: Retrieve detailed metadata for specific papers ✅
 - 📄 PDF Download: Download full-text PDF content when available ✅
 
@@ -96,16 +97,37 @@ python sci_hub_server.py
 
 If all mirrors return Cloudflare challenge pages, configure `SCIHUB_PROXY` or `SCIHUB_COOKIE` and retry.
 
+## Configure Fallback Providers
+
+Sci-Hub remains the first lookup target. When a DOI/title search is not resolved on Sci-Hub, the server can automatically query:
+
+- Unpaywall
+- OpenAlex
+- arXiv
+- bioRxiv / medRxiv
+- Google Scholar (best-effort scraping)
+
+Environment variables:
+
+- `UNPAYWALL_EMAIL`: Required to enable Unpaywall API calls
+- `SCIHUB_ENABLE_UNPAYWALL`: Enable/disable Unpaywall fallback (`true` by default)
+- `SCIHUB_ENABLE_OPENALEX`: Enable/disable OpenAlex fallback (`true` by default)
+- `SCIHUB_ENABLE_ARXIV`: Enable/disable arXiv fallback (`true` by default)
+- `SCIHUB_ENABLE_RXIV`: Enable/disable bioRxiv/medRxiv fallback (`true` by default)
+- `SCIHUB_ENABLE_GOOGLE_SCHOLAR`: Enable/disable Google Scholar fallback (`true` by default)
+- `SCHOLAR_BASE_URL`: Override Google Scholar endpoint (default: `https://scholar.google.com/scholar`)
+
 ### Keyword Search Behavior
 
-`search_scihub_by_keyword` now returns up to `num_results` items even when some PDFs cannot be resolved.  
+`search_scihub_by_keyword` now returns up to `num_results` items across multiple sources.  
 Each item has:
-- `status: "success"` when a Sci-Hub PDF URL was resolved
-- `status: "metadata_only"` when CrossRef metadata was found but Sci-Hub PDF resolution failed
+- `status: "success"` when a paper URL was resolved from Sci-Hub or a fallback provider
+- `status: "metadata_only"` when metadata was found but no downloadable URL was resolved
+- `source` identifies which provider returned the URL (for example `sci_hub`, `openalex`, `arxiv`, `google_scholar`)
 
 ### Download Behavior
 
-`download_scihub_pdf` accepts direct PDF URLs and Sci-Hub page URLs.  
+`download_scihub_pdf` accepts DOI strings, direct PDF URLs, and landing/page URLs (including Sci-Hub pages and open-access landing pages).  
 If the provided `output_path` is not writable in the MCP runtime (for example VM paths like `/home/claude/...`), it automatically falls back to `SCIHUB_DOWNLOAD_DIR` (or `~/Downloads`).
 
 ## Usage with Claude Desktop (Network MCP Connectors)
@@ -136,9 +158,9 @@ python sci_hub_server.py --transport stdio
 The Sci-Hub MCP Server provides the following tools:
 
 1. `search_scihub_by_doi`: Search for a paper on Sci-Hub using its DOI (Digital Object Identifier).
-2. `search_scihub_by_title`: Search for a paper on Sci-Hub using its title.
-3. `search_scihub_by_keyword`: Search for papers on Sci-Hub using a keyword.
-4. `download_scihub_pdf`: Download a paper PDF from Sci-Hub.
+2. `search_scihub_by_title`: Search for a paper using title lookup + provider fallbacks.
+3. `search_scihub_by_keyword`: Search for papers by keyword with provider fallbacks.
+4. `download_scihub_pdf`: Download a paper PDF from URL/DOI using provider-aware fallback resolution.
 5. `get_paper_metadata`: Get metadata information for a paper using its DOI.
 
 ### Searching Papers by DOI
