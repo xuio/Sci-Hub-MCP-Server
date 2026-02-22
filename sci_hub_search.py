@@ -820,6 +820,34 @@ def _search_arxiv(query: str, max_results: int = 5, search_field: str = "all") -
         return [], f"request_error:{type(exc).__name__}:{exc}"
 
 
+def _arxiv_id_from_doi(doi: str) -> str:
+    text = (doi or "").strip()
+    match = re.match(r"^10\.48550/arxiv\.(.+)$", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    arxiv_id = match.group(1).strip()
+    return arxiv_id
+
+
+def _arxiv_candidate_from_id(arxiv_id: str, doi: str = "", title: str = "") -> Dict[str, Any]:
+    normalized_id = (arxiv_id or "").strip()
+    if not normalized_id:
+        return {}
+
+    abs_url = f"https://arxiv.org/abs/{normalized_id}"
+    pdf_url = f"https://arxiv.org/pdf/{normalized_id}.pdf"
+    return _build_candidate(
+        provider="arxiv",
+        pdf_url=pdf_url,
+        landing_url=abs_url,
+        doi=(doi or "").strip(),
+        title=(title or "").strip(),
+        author="",
+        year="",
+        direct_pdf=True,
+    )
+
+
 def _get_rxiv_candidates_by_doi(doi: str) -> Tuple[List[Dict[str, Any]], str]:
     if not _provider_enabled("RXIV", True):
         return [], "disabled"
@@ -830,7 +858,7 @@ def _get_rxiv_candidates_by_doi(doi: str) -> Tuple[List[Dict[str, Any]], str]:
     for server in ("biorxiv", "medrxiv"):
         try:
             response = requests.get(
-                f"https://api.biorxiv.org/details/{server}/{quote(doi, safe='')}",
+                f"https://api.biorxiv.org/details/{server}/{quote(doi, safe='/')}",
                 timeout=15,
                 headers=_api_headers(),
             )
@@ -1023,6 +1051,14 @@ def _collect_fallback_candidates_for_doi(doi: str, title_hint: str = "") -> Tupl
             candidates.extend([item for item in provider_candidates if keep_for_requested_doi(item)])
         elif reason and reason not in {"disabled", "email_not_configured"}:
             errors.append(f"{provider}:{reason}")
+
+    # Special handling for DataCite arXiv DOI format (10.48550/arXiv.<id>).
+    if _provider_enabled("ARXIV", True):
+        arxiv_id = _arxiv_id_from_doi(doi)
+        if arxiv_id:
+            direct = _arxiv_candidate_from_id(arxiv_id, doi=doi, title=title_hint)
+            if direct:
+                candidates.append(direct)
 
     scholar_query = doi or title_hint
     if scholar_query:
